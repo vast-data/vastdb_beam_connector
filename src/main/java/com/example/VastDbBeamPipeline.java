@@ -1,23 +1,23 @@
 package com.example;
 
-import com.example.config.VastDbPipelineOptions;
-import com.example.io.VastDbIO;
-import com.example.transforms.VastDbBatchWriter;
-import com.example.utils.SchemaConverter;
-import com.example.utils.VastDbTableUtils;
-import com.example.utils.VastDbUtils;
-import com.vastdata.vdb.sdk.Table;
-import com.vastdata.vdb.sdk.VastSdk;
-
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.Row;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.example.config.VastDbPipelineOptions;
+import com.example.io.VastDbIO;
+import com.example.transforms.VastDbBatchWriter;
+import com.example.utils.SchemaConverter;
+import com.example.utils.VastDbTableUtils;
+import com.example.utils.VastDbUtils;
+import com.vastdata.vdb.sdk.VastSdk;
 
 /**
  * Main class for the VastDB Beam Pipeline MVP.
@@ -45,13 +45,18 @@ public class VastDbBeamPipeline {
         ensureTableExists(options, beamSchema);
 
         // Read lines from the input file and convert them to Row objects
-        pipeline.apply("ReadInputFile", TextIO.read().from(options.getInputFile()))
-                .apply("ParseInputToRows", ParDo.of(new ParseTextToRow(beamSchema)))
-                .apply("WriteToBatchWriter", ParDo.of(new VastDbBatchWriter(
-                        options.getVastDbEndpoint().get(),
-                        options.getVastDbSchemaName().get(),
-                        options.getVastDbTableName().get(),
-                        options.getBatchSize().get())));
+        PCollection<String> lines = pipeline.apply("ReadInputFile", TextIO.read().from(options.getInputFile()));
+        
+        // Parse lines to Row objects with schema
+        PCollection<Row> rows = lines.apply("ParseInputToRows", ParDo.of(new ParseTextToRow(beamSchema)))
+                .setRowSchema(beamSchema); // This sets the schema for the PCollection
+
+        // Write rows to VastDB
+        rows.apply("WriteToBatchWriter", ParDo.of(new VastDbBatchWriter(
+                options.getVastDbEndpoint().get(),
+                options.getVastDbSchemaName().get(),
+                options.getVastDbTableName().get(),
+                options.getBatchSize().get())));
 
         // Run the pipeline
         pipeline.run().waitUntilFinish();
@@ -79,6 +84,8 @@ public class VastDbBeamPipeline {
                             .withFieldValue("y", parts[1].trim())
                             .build();
                     out.output(row);
+                } else {
+                    LOG.warn("Skipping line with insufficient columns: {}", line);
                 }
             } catch (Exception e) {
                 LOG.error("Error parsing line: {}", line, e);
@@ -101,6 +108,7 @@ public class VastDbBeamPipeline {
         // Read and write using VastDbIO
         pipeline.apply("ReadInputFile", TextIO.read().from(options.getInputFile()))
                 .apply("ParseInputToRows", ParDo.of(new ParseTextToRow(beamSchema)))
+                .setRowSchema(beamSchema) // Set schema here too
                 .apply("WriteToVastDb", VastDbIO.write()
                         .withEndpoint(options.getVastDbEndpoint())
                         .withSchemaName(options.getVastDbSchemaName())
@@ -118,15 +126,20 @@ public class VastDbBeamPipeline {
             String schemaName = options.getVastDbSchemaName().get();
             String tableName = options.getVastDbTableName().get();
 
+            LOG.info("Ensuring table exists at endpoint: {}, schema: {}, table: {}", endpoint, schemaName, tableName);
+            
             VastSdk vastSdk = VastDbUtils.createVastSdk(endpoint);
             
             // First ensure schema exists
+            LOG.info("Checking if schema exists: {}", schemaName);
             VastDbTableUtils.createSchemaIfNotExists(vastSdk, schemaName);
             
             // Convert Beam schema to Arrow schema
-            Schema arrowSchema = SchemaConverter.beamSchemaToArrowSchemaWithBeamUtils(beamSchema);
+            LOG.info("Converting Beam schema to Arrow schema");
+            Schema arrowSchema = SchemaConverter.beamSchemaToArrowSchema(beamSchema);
             
             // Create table if not exists
+            LOG.info("Checking if table exists: {}", tableName);
             VastDbTableUtils.createTableIfNotExists(vastSdk, schemaName, tableName, arrowSchema);
             
             LOG.info("Successfully ensured table {}/{} exists with required schema", schemaName, tableName);
